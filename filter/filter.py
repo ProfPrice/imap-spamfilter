@@ -135,9 +135,25 @@ class Account:
     # value across multiple accounts to pool their Bayes training.
     bayes_user: str | None = None
 
+    # Extra folders scanned like the Inbox (e.g. SaneBox's @SaneLater).
+    # Mail that a third-party sorter moved there is scored and acted on,
+    # but the sorter's move itself is never treated as a training signal.
+    watch_folders: list[str] = field(default_factory=list)
+    # Inbox mail younger than this (by INTERNALDATE) is not scored or
+    # acted on yet, so a sorter that files Inbox mail shortly after
+    # delivery (SaneBox) gets the first move. 0 = act immediately.
+    inbox_settle_seconds: int = 0
+    # A message above the scan bookmark counts as new mail if it is
+    # UNSEEN or, when this is > 0, its INTERNALDATE is at most this old.
+    # 0 keeps the upstream rule (UNSEEN only).
+    new_mail_max_age_seconds: int = 0
+    # How often watch_folders are polled (they have no IDLE push).
+    watch_poll_interval: int = 60
+
     # Populated at runtime once IMAP delimiter is known.
     delimiter: str = "/"
     folder_map: dict[str, str] = field(default_factory=dict)
+    watch_resolved: list[str] = field(default_factory=list)
 
 
 # Built-in defaults applied unless overridden in accounts.yml `defaults:` or in
@@ -182,6 +198,10 @@ BUILTIN_DEFAULTS: dict[str, Any] = {
     # them. Lets Apple Mail / Thunderbird / Outlook users keep their client-
     # chosen folder name (e.g. "Spam") without editing accounts.yml.
     "auto_special_folders": True,
+    "watch_folders": [],
+    "inbox_settle_seconds": 0,
+    "new_mail_max_age_seconds": 0,
+    "watch_poll_interval": 60,
 }
 
 REQUIRED_PER_ACCOUNT: tuple[str, ...] = ("name", "user", "password", "imap_host")
@@ -224,6 +244,16 @@ def _clean_bayes_user(raw: Any, account_name: str) -> str | None:
     return s
 
 
+def _clean_watch_folders(raw: Any, account_name: str) -> list[str]:
+    if not raw:
+        return []
+    if not isinstance(raw, list) or not all(isinstance(x, str) and x for x in raw):
+        raise SystemExit(
+            f"account {account_name!r}: watch_folders must be a list of folder names"
+        )
+    return list(raw)
+
+
 def load_accounts(path: Path) -> list[Account]:
     raw = yaml.safe_load(path.read_text())
     if not isinstance(raw, dict) or "accounts" not in raw:
@@ -236,6 +266,10 @@ def load_accounts(path: Path) -> list[Account]:
         if not isinstance(entry, dict):
             raise SystemExit(f"{path}: each account must be a mapping")
         merged = _deep_merge(defaults, entry)
+        # `password_env: NAME` reads the IMAP password from an environment
+        # variable so it can live in the compose .env instead of this file.
+        if not merged.get("password") and merged.get("password_env"):
+            merged["password"] = os.environ.get(str(merged["password_env"]), "")
         missing = [k for k in REQUIRED_PER_ACCOUNT if not merged.get(k)]
         if missing:
             raise SystemExit(
@@ -276,6 +310,10 @@ def load_accounts(path: Path) -> list[Account]:
                 learn_from_moves=bool(merged["learn_from_moves"]),
                 auto_special_folders=bool(merged["auto_special_folders"]),
                 bayes_user=_clean_bayes_user(merged.get("bayes_user"), merged.get("name", "?")),
+                watch_folders=_clean_watch_folders(merged.get("watch_folders"), merged.get("name", "?")),
+                inbox_settle_seconds=int(merged["inbox_settle_seconds"]),
+                new_mail_max_age_seconds=int(merged["new_mail_max_age_seconds"]),
+                watch_poll_interval=int(merged["watch_poll_interval"]),
             )
         except KeyError as ex:
             raise SystemExit(f"account {entry.get('name')!r}: missing config key {ex.args[0]!r}") from ex
@@ -345,6 +383,18 @@ def validate_account(acc: Account) -> None:
         raise SystemExit(f"{acc.name}: grace values must be >= 0")
     if acc.junk_retention_days < 0 or acc.trained_retention_days < 0:
         raise SystemExit(f"{acc.name}: retention days must be >= 0")
+    if len(set(acc.watch_folders)) != len(acc.watch_folders):
+        raise SystemExit(f"{acc.name}: watch_folders contains duplicates")
+    clash = folder_set & set(acc.watch_folders)
+    if clash:
+        raise SystemExit(
+            f"{acc.name}: watch_folders must not include inbox/junk/trash/"
+            f"train folders ({', '.join(sorted(clash))})"
+        )
+    if acc.inbox_settle_seconds < 0 or acc.new_mail_max_age_seconds < 0:
+        raise SystemExit(f"{acc.name}: settle/max-age values must be >= 0")
+    if acc.watch_poll_interval < 30:
+        raise SystemExit(f"{acc.name}: watch_poll_interval must be >= 30")
 
 
 # ---------------------------------------------------------------------------
@@ -380,11 +430,12 @@ CREATE TABLE IF NOT EXISTS uidvalidity (
 
 CREATE TABLE IF NOT EXISTS pending_move (
     account     TEXT NOT NULL,
+    folder      TEXT NOT NULL DEFAULT 'INBOX',
     uidvalidity INTEGER NOT NULL,
     uid         INTEGER NOT NULL,
     message_id  TEXT NOT NULL,
     flag_at     INTEGER NOT NULL,
-    PRIMARY KEY (account, uidvalidity, uid)
+    PRIMARY KEY (account, folder, uidvalidity, uid)
 );
 
 -- High-water UID per (account, folder, uidvalidity). scan_inbox uses
@@ -443,6 +494,31 @@ def _migrate(conn: sqlite3.Connection) -> None:
     cols = {r[1] for r in conn.execute("PRAGMA table_info(messages)")}
     if "received_at" not in cols:
         conn.execute("ALTER TABLE messages ADD COLUMN received_at INTEGER")
+    # pending_move gained a folder column (moves from watch_folders, not
+    # only the Inbox). The primary key changes, so rebuild the table; rows
+    # from before the change were all Inbox moves.
+    pm_cols = {r[1] for r in conn.execute("PRAGMA table_info(pending_move)")}
+    if "folder" not in pm_cols:
+        conn.executescript(
+            """
+            BEGIN;
+            ALTER TABLE pending_move RENAME TO pending_move_old;
+            CREATE TABLE pending_move (
+                account     TEXT NOT NULL,
+                folder      TEXT NOT NULL DEFAULT 'INBOX',
+                uidvalidity INTEGER NOT NULL,
+                uid         INTEGER NOT NULL,
+                message_id  TEXT NOT NULL,
+                flag_at     INTEGER NOT NULL,
+                PRIMARY KEY (account, folder, uidvalidity, uid)
+            );
+            INSERT INTO pending_move(account, folder, uidvalidity, uid, message_id, flag_at)
+                SELECT account, 'INBOX', uidvalidity, uid, message_id, flag_at
+                  FROM pending_move_old;
+            DROP TABLE pending_move_old;
+            COMMIT;
+            """
+        )
 
 
 class Db:
@@ -554,31 +630,31 @@ class Db:
 
     # ----- pending_move (flag->move grace, filter-initiated only) ----------
 
-    def add_pending_move(self, uidvalidity: int, uid: int, msgid: str) -> None:
+    def add_pending_move(self, folder: str, uidvalidity: int, uid: int, msgid: str) -> None:
         self.conn.execute(
             """
-            INSERT OR IGNORE INTO pending_move(account, uidvalidity, uid, message_id, flag_at)
-            VALUES(?,?,?,?,?)
+            INSERT OR IGNORE INTO pending_move(account, folder, uidvalidity, uid, message_id, flag_at)
+            VALUES(?,?,?,?,?,?)
             """,
-            (self.account, uidvalidity, uid, msgid, int(time.time())),
+            (self.account, folder, uidvalidity, uid, msgid, int(time.time())),
         )
 
-    def due_pending_moves(self, uidvalidity: int, grace_s: int) -> list[sqlite3.Row]:
+    def due_pending_moves(self, folder: str, uidvalidity: int, grace_s: int) -> list[sqlite3.Row]:
         cutoff = int(time.time()) - grace_s
         cur = self.conn.execute(
             """
             SELECT uid, message_id, flag_at FROM pending_move
-            WHERE account=? AND uidvalidity=? AND flag_at<=?
+            WHERE account=? AND folder=? AND uidvalidity=? AND flag_at<=?
             ORDER BY flag_at
             """,
-            (self.account, uidvalidity, cutoff),
+            (self.account, folder, uidvalidity, cutoff),
         )
         return list(cur.fetchall())
 
-    def drop_pending_move(self, uidvalidity: int, uid: int) -> None:
+    def drop_pending_move(self, folder: str, uidvalidity: int, uid: int) -> None:
         self.conn.execute(
-            "DELETE FROM pending_move WHERE account=? AND uidvalidity=? AND uid=?",
-            (self.account, uidvalidity, uid),
+            "DELETE FROM pending_move WHERE account=? AND folder=? AND uidvalidity=? AND uid=?",
+            (self.account, folder, uidvalidity, uid),
         )
 
     # ----- scan bookmark ----------------------------------------------------
@@ -913,6 +989,29 @@ def ensure_folders(client: IMAPClient, log: logging.Logger, fmap: dict[str, str]
             log.warning("create_folder(%s) failed: %s", f, ex)
 
 
+def resolve_watch_folders(
+    client: IMAPClient, log: logging.Logger, acc: Account, delim: str
+) -> list[str]:
+    """Resolve watch_folders to server names. Missing folders are skipped
+    with a warning, never created: they belong to the user or the sorter."""
+    out: list[str] = []
+    core = set(acc.folder_map.values())
+    for name in acc.watch_folders:
+        f = resolve_folder(name, delim)
+        if f in core:
+            log.warning("watch folder %s is a core folder; ignoring", f)
+            continue
+        try:
+            client.select_folder(f, readonly=True)
+        except IMAPClientError:
+            log.warning("watch folder %s not found on server; ignoring", f)
+            continue
+        out.append(f)
+    if out:
+        log.info("watching extra folders: %s", ", ".join(out))
+    return out
+
+
 def select_with_uidvalidity_check(
     client: IMAPClient, db: Db, folder: str, log: logging.Logger, readonly: bool = False
 ) -> int:
@@ -924,8 +1023,8 @@ def select_with_uidvalidity_check(
         db.log_event("uidvalidity_change", detail=f"{folder} {stored}->{uv}")
         with db.tx():
             db.conn.execute(
-                "DELETE FROM pending_move WHERE account=? AND uidvalidity=?",
-                (db.account, stored),
+                "DELETE FROM pending_move WHERE account=? AND folder=? AND uidvalidity=?",
+                (db.account, folder, stored),
             )
             # Drop the scan_bookmark for the prior uidvalidity. The new
             # uv has its own UID space starting at 1; without this delete
@@ -1017,6 +1116,7 @@ def fetch_chunked(
 @dataclass
 class AccountState:
     last_junk_poll: float = 0.0
+    last_watch_poll: float = 0.0
     last_retention: float = 0.0
     scan_fail_streak: int = 0
 
@@ -1151,6 +1251,29 @@ def try_learn(
 # ----- scan / poll / drain -------------------------------------------------
 
 
+def source_folders(acc: Account, fmap: dict[str, str]) -> list[str]:
+    """Folders new mail is scanned in: the Inbox plus any watch_folders.
+    A user move from one of these into Junk teaches spam; a move from
+    Junk back into one of them teaches ham."""
+    return [fmap["inbox"], *acc.watch_resolved]
+
+
+_ENVELOPE_HEADERS = b"BODY.PEEK[HEADER.FIELDS (MESSAGE-ID FROM SUBJECT)]"
+
+
+def _header_bytes(data: dict) -> bytes:
+    for k, v in data.items():
+        if isinstance(k, bytes) and k.startswith(b"BODY[HEADER.FIELDS") and v:
+            return v
+    return data.get(_ENVELOPE_HEADERS) or b""
+
+
+def _fetch_body(client: IMAPClient, uid: int) -> bytes | None:
+    data = client.fetch([uid], [b"BODY.PEEK[]"])
+    d = data.get(uid, {})
+    return d.get(b"BODY[]") or d.get(b"BODY.PEEK[]")
+
+
 def scan_inbox(
     client: IMAPClient,
     db: Db,
@@ -1159,30 +1282,61 @@ def scan_inbox(
     fmap: dict[str, str],
     state: "AccountState | None" = None,
 ) -> None:
-    uv = select_with_uidvalidity_check(client, db, fmap["inbox"], log)
+    scan_folder(client, db, log, acc, fmap, fmap["inbox"], state=state, is_inbox=True)
+
+
+def scan_watch_folders(
+    client: IMAPClient,
+    db: Db,
+    log: logging.Logger,
+    acc: Account,
+    fmap: dict[str, str],
+    state: "AccountState | None" = None,
+) -> None:
+    for folder in acc.watch_resolved:
+        if SHUTDOWN.is_set():
+            return
+        try:
+            scan_folder(client, db, log, acc, fmap, folder, state=state, is_inbox=False)
+        except IMAPClientError as ex:
+            log.warning("scan %s failed: %s", folder, ex)
+
+
+def scan_folder(
+    client: IMAPClient,
+    db: Db,
+    log: logging.Logger,
+    acc: Account,
+    fmap: dict[str, str],
+    folder: str,
+    *,
+    state: "AccountState | None" = None,
+    is_inbox: bool = True,
+) -> None:
+    uv = select_with_uidvalidity_check(client, db, folder, log)
     # High-water UID bookmark: the filter never scans mail that already
     # existed when it first saw this (folder, uidvalidity). The first
     # pass per uv records the current max UID and returns without
     # processing; subsequent passes only look at UIDs above it. This
-    # protects an existing populated Inbox from being scored+acted on
+    # protects an existing populated folder from being scored+acted on
     # the day the filter is turned on. Reverts (user moves a junked
-    # message back to Inbox) still surface because an IMAP MOVE/COPY
-    # assigns a fresh UID at the destination, which lands above the
-    # bookmark by construction.
-    bookmark = db.get_scan_bookmark(fmap["inbox"], uv)
+    # message back) still surface because an IMAP MOVE/COPY assigns a
+    # fresh UID at the destination, which lands above the bookmark by
+    # construction.
+    bookmark = db.get_scan_bookmark(folder, uv)
     if bookmark is None:
         existing = client.search(["ALL"])
         init_uid = max(existing) if existing else 0
         with db.tx():
-            db.set_scan_bookmark(fmap["inbox"], uv, init_uid)
+            db.set_scan_bookmark(folder, uv, init_uid)
             db.log_event(
                 "scan_bookmark_init",
-                detail=f"uv={uv} max_uid={init_uid} skipped={len(existing) if existing else 0}",
+                detail=f"{folder} uv={uv} max_uid={init_uid} skipped={len(existing) if existing else 0}",
             )
         log.info(
-            "scan_inbox: initialized bookmark for %s (uv=%d) at uid=%d, "
+            "scan: initialized bookmark for %s (uv=%d) at uid=%d, "
             "skipping %d pre-existing messages",
-            fmap["inbox"], uv, init_uid, len(existing) if existing else 0,
+            folder, uv, init_uid, len(existing) if existing else 0,
         )
         return
     # Only UIDs strictly above the bookmark are candidates. Server-side
@@ -1191,92 +1345,121 @@ def scan_inbox(
     new_range = f"{bookmark + 1}:*"
     unseen = client.search(["UNSEEN", "UID", new_range])
     new_uids = client.search(["UID", new_range])
-    candidates = sorted(set(unseen) | set(new_uids))
-    cap = acc.safe_mode_unseen_cap
-    if len(unseen) > cap:
-        reason = f"Inbox UNSEEN > {cap} ({len(unseen)}) - refusing to process"
-        log.error(reason)
-        with db.tx():
-            db.enter_safe_mode("all", reason)
-            db.log_event("safe_mode", detail=reason)
-        return
-    # Auto-exit safe mode once the trigger condition (unseen > cap) clears.
-    # The only enter_safe_mode("all", ...) call site is the cap check above,
-    # so observing unseen <= cap is sufficient to know it is safe to resume.
-    if db.in_safe_mode("all"):
-        log.info("exiting safe mode (unseen=%d back under cap=%d)",
-                 len(unseen), cap)
-        with db.tx():
-            db.exit_safe_mode("all")
-            db.log_event("safe_mode_exit", detail=f"unseen={len(unseen)}")
+    # "n:*" always matches the highest UID even when it is below n.
+    candidates = sorted(u for u in set(unseen) | set(new_uids) if u > bookmark)
+    unseen_set = {u for u in unseen if u > bookmark}
+    if is_inbox:
+        cap = acc.safe_mode_unseen_cap
+        if len(unseen_set) > cap:
+            reason = f"Inbox UNSEEN > {cap} ({len(unseen_set)}) - refusing to process"
+            log.error(reason)
+            with db.tx():
+                db.enter_safe_mode("all", reason)
+                db.log_event("safe_mode", detail=reason)
+            return
+        # Auto-exit safe mode once the trigger condition (unseen > cap)
+        # clears. The only enter_safe_mode("all", ...) call site is the cap
+        # check above, so observing unseen <= cap is sufficient.
+        if db.in_safe_mode("all"):
+            log.info("exiting safe mode (unseen=%d back under cap=%d)",
+                     len(unseen_set), cap)
+            with db.tx():
+                db.exit_safe_mode("all")
+                db.log_event("safe_mode_exit", detail=f"unseen={len(unseen_set)}")
 
     if not candidates:
         return
 
-    # Chunk the FETCH so a single oversized inbox does not allocate up
-    # to len(candidates) * MAX_FETCH_BYTES at once. With 200 candidates
-    # and 5 MB cap that would be 1 GB of resident memory.
+    settle_s = acc.inbox_settle_seconds if is_inbox else 0
+    now = int(time.time())
+    first_unsettled: int | None = None
+
+    # Headers first; the full body is fetched only for messages that are
+    # actually scored or learned. Chunked so a large backlog does not
+    # allocate everything at once.
     for chunk_start in range(0, len(candidates), SCAN_FETCH_CHUNK):
         if SHUTDOWN.is_set():
             return
         chunk = candidates[chunk_start : chunk_start + SCAN_FETCH_CHUNK]
-        fetched = client.fetch(chunk, [b"BODY.PEEK[]", b"FLAGS", b"INTERNALDATE"])
-        for uid, data in fetched.items():
+        fetched = client.fetch(chunk, [_ENVELOPE_HEADERS, b"FLAGS", b"INTERNALDATE"])
+        for uid in chunk:
             if SHUTDOWN.is_set():
                 return
-            raw = data.get(b"BODY[]") or data.get(b"BODY.PEEK[]")
-            if not raw:
+            data = fetched.get(uid)
+            if not data:
                 continue
             flags = _kw(data.get(b"FLAGS", ()))
-            msgid, subject, sender = parse_envelope(raw)
+            received = _internaldate_ts(data)
+            msgid, subject, sender = parse_envelope(_header_bytes(data))
             if not msgid:
-                log.debug("inbox uid %s: no Message-ID, skipping", uid)
+                log.debug("%s uid %s: no Message-ID, skipping", folder, uid)
                 continue
 
             prior = db.get_message(msgid)
             prior_folder = prior["current_folder"] if prior else None
-            with db.tx():
-                db.upsert_message(msgid, fmap["inbox"], sender, subject,
-                                  _internaldate_ts(data))
 
-            # Detect Junk -> Inbox revert (user moved a message we
-            # previously placed in Junk, or one that lived in Junk, back
-            # to Inbox). An IMAP move preserves the \Seen flag, so a
-            # reverted message the user already read in Junk arrives
-            # *seen*; gating this on `uid in unseen` would silently drop
-            # the most common ham signal. prior_folder flips to inbox
-            # after the upsert above, so this branch fires only once.
-            reverted = prior_folder == fmap["junk"]
-            if reverted:
+            if settle_s and received is not None and now - received < settle_s:
+                # Too new: leave it for the sorter (SaneBox) to file first.
+                # Record a row so a user move Inbox -> Junk during the
+                # settle window is still recognised as a training signal,
+                # but do not overwrite an existing row's folder.
+                if first_unsettled is None:
+                    first_unsettled = uid
+                if prior is None:
+                    with db.tx():
+                        db.upsert_message(msgid, folder, sender, subject, received)
+                continue
+
+            with db.tx():
+                db.upsert_message(msgid, folder, sender, subject, received)
+
+            # Detect Junk -> source-folder revert (user moved a message we
+            # previously placed in Junk, or one that lived in Junk, back).
+            # An IMAP move preserves the \Seen flag, so a reverted message
+            # the user already read in Junk arrives *seen*; gating this on
+            # unseen would silently drop the most common ham signal.
+            # prior_folder flips after the upsert above, so this branch
+            # fires only once.
+            if prior_folder == fmap["junk"]:
                 if NOTJUNK_KEYWORD in flags:
                     # User intent confirmed by $NotJunk keyword skips grace.
-                    try_learn(db, log, acc, raw, msgid, "ham", reason="revert+notjunk_kw")
+                    raw = _fetch_body(client, uid)
+                    if raw:
+                        try_learn(db, log, acc, raw, msgid, "ham", reason="revert+notjunk_kw")
                 elif prior["learned_as"] != "ham" and prior["pending_learn"] != "ham":
                     # Schedule ham learn after grace.
                     with db.tx():
                         db.update_message(msgid, pending_learn="ham", pending_learn_at=int(time.time()))
-                        db.log_event("pending_ham", msgid, detail="user revert")
+                        db.log_event("pending_ham", msgid, detail=f"user revert -> {folder}")
                 continue
 
-            # Skip scoring on already-scored messages (avoid duplicate moves).
+            # Skip scoring on already-scored messages (avoid duplicate
+            # moves). Covers mail scored in one source folder and then
+            # moved to another (e.g. @SaneLater -> Inbox by the user).
             if prior is not None and prior["our_score"] is not None:
                 continue
-            # Only score unseen messages on first appearance.
-            if uid not in unseen:
+            is_new = uid in unseen_set or (
+                acc.new_mail_max_age_seconds > 0
+                and received is not None
+                and now - received <= acc.new_mail_max_age_seconds
+            )
+            if not is_new:
                 continue
 
+            raw = _fetch_body(client, uid)
+            if not raw:
+                continue
             recipient = first_recipient(raw, acc.user)
             score = rspamd_scan(
                 raw, recipient, acc.reject_score_above, bayes_user=acc.bayes_user or acc.user
             )
             if score is None:
-                log.warning("scan failed for %s (uid=%s) - keeping in inbox", msgid, uid)
+                log.warning("scan failed for %s (uid=%s in %s) - leaving it in place", msgid, uid, folder)
                 db.log_event("scan_failed", msgid)
                 if state is not None:
                     state.scan_fail_streak += 1
                     # Escalate loudly at 1/10/50/250+ so rspamd downtime
-                    # shows up in logs and Unraid notification scrapers
-                    # without spamming once per scanned message.
+                    # shows up in logs without spamming once per message.
                     if state.scan_fail_streak in (1, 10, 50) or state.scan_fail_streak % 250 == 0:
                         log.error(
                             "rspamd scan failing: %d consecutive failures (check rspamd container)",
@@ -1291,8 +1474,8 @@ def scan_inbox(
 
             with db.tx():
                 db.update_message(msgid, our_score=score)
-                db.log_event("scan", msgid, detail=f"score={score:.2f} mode={acc.mode}")
-            log.debug("scored %s = %.2f", msgid, score)
+                db.log_event("scan", msgid, detail=f"score={score:.2f} mode={acc.mode} folder={folder}")
+            log.debug("scored %s = %.2f (%s)", msgid, score, folder)
 
             if score < acc.threshold:
                 continue
@@ -1300,36 +1483,33 @@ def scan_inbox(
             # Over threshold: act according to mode.
             match acc.mode:
                 case "shadow":
-                    log.info("[shadow] would flag %s score=%.2f subj=%r", msgid, score, subject[:80])
+                    log.info("[shadow] would flag %s score=%.2f folder=%s subj=%r",
+                             msgid, score, folder, subject[:80])
                     with db.tx():
                         db.update_message(msgid, our_action="shadow")
                 case "flag":
                     client.add_flags(uid, [b"\\Flagged"])
-                    log.info("[flag] flagged %s score=%.2f", msgid, score)
+                    log.info("[flag] flagged %s score=%.2f folder=%s", msgid, score, folder)
                     with db.tx():
                         db.update_message(msgid, our_action="flagged")
-                        db.log_event("flagged", msgid, detail=f"score={score:.2f}")
+                        db.log_event("flagged", msgid, detail=f"score={score:.2f} folder={folder}")
                 case "move":
                     # Do NOT set \Flagged: that is the user's "starred"
-                    # flag and we pollute it once per spam during the
-                    # grace window. Record the pending_move with just a
-                    # DB row + event - the move happens after
-                    # move_grace_seconds whether or not the flag is set.
+                    # flag. Record the pending_move with just a DB row +
+                    # event - the move happens after move_grace_seconds.
                     with db.tx():
-                        db.add_pending_move(uv, uid, msgid)
+                        db.add_pending_move(folder, uv, uid, msgid)
                         db.update_message(msgid, our_action="pending_move")
-                        db.log_event("pending_move", msgid, detail=f"score={score:.2f}")
+                        db.log_event("pending_move", msgid, detail=f"score={score:.2f} folder={folder}")
 
-    # Loop fell through naturally: every candidate UID was considered.
-    # Advance the bookmark past the highest one so the next pass starts
-    # above it. set_scan_bookmark refuses to regress, so an early SHUTDOWN
-    # that skipped this point (return statements above) just leaves the
-    # bookmark where it was - next iteration re-discovers the same UIDs
-    # via UID range and reprocesses idempotently.
-    if candidates:
-        new_max = max(candidates)
-        with db.tx():
-            db.set_scan_bookmark(fmap["inbox"], uv, new_max)
+    # Advance the bookmark past everything handled. Unsettled Inbox mail
+    # holds it just below the first unsettled UID so that mail is looked
+    # at again next pass; settled UIDs above it are re-seen idempotently
+    # (already-scored rows are skipped). set_scan_bookmark refuses to
+    # regress, and an early SHUTDOWN return leaves it untouched.
+    new_max = (first_unsettled - 1) if first_unsettled is not None else max(candidates)
+    with db.tx():
+        db.set_scan_bookmark(folder, uv, new_max)
 
 
 def execute_due_moves(client: IMAPClient, db: Db, log: logging.Logger, acc: Account, fmap: dict[str, str]) -> None:
@@ -1337,11 +1517,23 @@ def execute_due_moves(client: IMAPClient, db: Db, log: logging.Logger, acc: Acco
         return
     if db.in_safe_mode("all"):
         return
-    uv = select_with_uidvalidity_check(client, db, fmap["inbox"], log)
-    rows = db.due_pending_moves(uv, acc.move_grace_seconds)
+    for folder in source_folders(acc, fmap):
+        if SHUTDOWN.is_set():
+            return
+        try:
+            _execute_due_moves_in(client, db, log, acc, fmap, folder)
+        except IMAPClientError as ex:
+            log.warning("pending moves in %s failed: %s", folder, ex)
+
+
+def _execute_due_moves_in(
+    client: IMAPClient, db: Db, log: logging.Logger, acc: Account, fmap: dict[str, str], folder: str
+) -> None:
+    uv = select_with_uidvalidity_check(client, db, folder, log)
+    rows = db.due_pending_moves(folder, uv, acc.move_grace_seconds)
     if not rows:
         return
-    if not check_rate(db, log,"move", acc.max_moves_per_hour):
+    if not check_rate(db, log, "move", acc.max_moves_per_hour):
         return
 
     uids = [r["uid"] for r in rows]
@@ -1350,8 +1542,9 @@ def execute_due_moves(client: IMAPClient, db: Db, log: logging.Logger, acc: Acco
     for r in rows:
         uid = r["uid"]
         if uid not in fetched:
+            # Gone from this folder (the user or the sorter moved it).
             with db.tx():
-                db.drop_pending_move(uv, uid)
+                db.drop_pending_move(folder, uv, uid)
                 db.log_event("move_skipped_missing", r["message_id"])
             continue
         to_move.append(uid)
@@ -1359,10 +1552,7 @@ def execute_due_moves(client: IMAPClient, db: Db, log: logging.Logger, acc: Acco
     if not to_move:
         return
 
-    # Cap this batch to the hourly quota still available. check_rate
-    # above only confirms at least one slot is free; without subtracting
-    # the moves already recorded this hour, a single batch could move a
-    # further max_moves_per_hour on top of them.
+    # Cap this batch to the hourly quota still available.
     remaining = acc.max_moves_per_hour - db.rate_count("move", 3600)
     to_move = to_move[: max(0, remaining)]
     if not to_move:
@@ -1379,7 +1569,7 @@ def execute_due_moves(client: IMAPClient, db: Db, log: logging.Logger, acc: Acco
         for r in rows:
             if r["uid"] not in to_move:
                 continue
-            db.drop_pending_move(uv, r["uid"])
+            db.drop_pending_move(folder, uv, r["uid"])
             db.update_message(
                 r["message_id"],
                 current_folder=fmap["junk"],
@@ -1387,8 +1577,8 @@ def execute_due_moves(client: IMAPClient, db: Db, log: logging.Logger, acc: Acco
                 moved_to_junk_at=now,
             )
             db.record_rate("move")
-            db.log_event("moved_to_junk", r["message_id"])
-    log.info("moved %d message(s) inbox->junk", len(to_move))
+            db.log_event("moved_to_junk", r["message_id"], detail=f"from {folder}")
+    log.info("moved %d message(s) %s->junk", len(to_move), folder)
 
 
 def poll_junk(client: IMAPClient, db: Db, log: logging.Logger, acc: Account, fmap: dict[str, str]) -> None:
@@ -1404,15 +1594,13 @@ def poll_junk(client: IMAPClient, db: Db, log: logging.Logger, acc: Account, fma
         if SHUTDOWN.is_set():
             return
         chunk = uids[chunk_start : chunk_start + SCAN_FETCH_CHUNK]
-        fetched = client.fetch(chunk, [b"BODY.PEEK[]", b"FLAGS", b"INTERNALDATE"])
+        # Headers only: the body is fetched just for an immediate learn.
+        fetched = client.fetch(chunk, [_ENVELOPE_HEADERS, b"FLAGS", b"INTERNALDATE"])
         for uid, data in fetched.items():
             if SHUTDOWN.is_set():
                 return
-            raw = data.get(b"BODY[]") or data.get(b"BODY.PEEK[]")
-            if not raw:
-                continue
             flags = _kw(data.get(b"FLAGS", ()))
-            msgid, subject, sender = parse_envelope(raw)
+            msgid, subject, sender = parse_envelope(_header_bytes(data))
             if not msgid:
                 continue
             prior = db.get_message(msgid)
@@ -1424,16 +1612,17 @@ def poll_junk(client: IMAPClient, db: Db, log: logging.Logger, acc: Account, fma
             # Filter put it here: nothing to learn. Skip.
             if prior is not None and prior["our_action"] == "moved_to_junk":
                 continue
-            # Learn spam only from a confirmed user move Inbox -> Junk,
-            # i.e. we have a prior row showing the message was in Inbox.
-            # Mail with no prior row (delivered straight to Junk by the
-            # provider's own filter, never seen in Inbox) is NOT an
-            # explicit user move and is deliberately not learned - that
-            # would train Bayes on the provider's verdict, including its
-            # false positives.
-            if prior_folder == fmap["inbox"]:
+            # Learn spam only from a confirmed user move source -> Junk,
+            # i.e. we have a prior row showing the message was in the
+            # Inbox or a watch folder. Mail with no prior row (delivered
+            # straight to Junk by the provider's own filter, or moved from
+            # an unwatched folder such as @SaneBlackHole) is NOT learned -
+            # that would train Bayes on someone else's verdict.
+            if prior_folder in source_folders(acc, fmap):
                 if JUNK_KEYWORD in flags:
-                    try_learn(db, log, acc, raw, msgid, "spam", reason="user_move+junk_kw")
+                    raw = _fetch_body(client, uid)
+                    if raw:
+                        try_learn(db, log, acc, raw, msgid, "spam", reason="user_move+junk_kw")
                 else:
                     with db.tx():
                         if not prior or prior["pending_learn"] != "spam":
@@ -1443,7 +1632,7 @@ def poll_junk(client: IMAPClient, db: Db, log: logging.Logger, acc: Account, fma
                                 pending_learn_at=int(time.time()),
                                 moved_to_junk_at=int(time.time()),
                             )
-                            db.log_event("pending_spam", msgid, detail="user move inbox->junk")
+                            db.log_event("pending_spam", msgid, detail=f"user move {prior_folder}->junk")
 
     process_pending_learns(client, db, log, acc, fmap)
 
@@ -1481,13 +1670,13 @@ def process_pending_learns(
                 return
             msgid = r["message_id"]
             kind = r["pending_learn"]
-            # Spam pending must still be in Junk; ham pending must still be in Inbox.
+            # Spam pending must still be in Junk; ham pending must still be in a source folder.
             if kind == "spam" and folder != fmap["junk"]:
                 with db.tx():
                     db.update_message(msgid, pending_learn=None, pending_learn_at=None)
                     db.log_event("pending_canceled", msgid, detail="moved before grace")
                 continue
-            if kind == "ham" and folder != fmap["inbox"]:
+            if kind == "ham" and folder not in source_folders(acc, fmap):
                 with db.tx():
                     db.update_message(msgid, pending_learn=None, pending_learn_at=None)
                     db.log_event("pending_canceled", msgid, detail="moved before grace")
@@ -1660,6 +1849,9 @@ def drain_train_ham(
 def retention_sweep(
     client: IMAPClient, db: Db, log: logging.Logger, acc: Account, fmap: dict[str, str]
 ) -> None:
+    # Shadow mode promises no mailbox changes beyond the training folders.
+    if acc.mode == "shadow":
+        return
     if acc.junk_retention_days > 0:
         _sweep_folder_to_trash(
             client, db, log, acc, fmap,
@@ -1828,6 +2020,7 @@ def _run_account(acc: Account, db: Db) -> None:
                             setattr(acc, key, remapped)
             acc.folder_map = build_folder_map(acc, delim)
             ensure_folders(client, log, acc.folder_map)
+            acc.watch_resolved = resolve_watch_folders(client, log, acc, delim)
             idle_cap = client.has_capability("IDLE")
             log.info("connected, delimiter=%r, mode=%s, IMAP IDLE=%s",
                      delim, acc.mode, "yes" if idle_cap else "no")
@@ -1853,6 +2046,12 @@ def _run_account(acc: Account, db: Db) -> None:
                 scan_inbox(client, db, log, acc, acc.folder_map, state)
                 if SHUTDOWN.is_set():
                     break
+                now = time.monotonic()
+                if acc.watch_resolved and now - state.last_watch_poll >= acc.watch_poll_interval:
+                    scan_watch_folders(client, db, log, acc, acc.folder_map, state)
+                    state.last_watch_poll = now
+                    if SHUTDOWN.is_set():
+                        break
                 execute_due_moves(client, db, log, acc, acc.folder_map)
 
                 now = time.monotonic()
@@ -1898,6 +2097,11 @@ def _run_account(acc: Account, db: Db) -> None:
                 # any server-side IDLE cap (RFC 2177 mentions 29 min).
                 client.select_folder(acc.folder_map["inbox"])
                 wait = min(acc.idle_timeout, max(30, acc.junk_poll_interval))
+                if acc.watch_resolved:
+                    wait = min(wait, acc.watch_poll_interval)
+                if acc.inbox_settle_seconds:
+                    # Re-check unsettled Inbox mail at least once a minute.
+                    wait = min(wait, 60)
                 # 30s idle_chunk keeps us comfortably below the 60s socket
                 # timeout, so a hung peer is detected within one chunk and
                 # SHUTDOWN is observed within ~30s rather than ~120s.
